@@ -18,6 +18,10 @@ interface ScoreDisplayProps {
   beatsPerMeasure?: number;
   keySignature?: string;
   onSeek?: (noteIndex: number) => void;
+  label?: string;
+  labelColor?: string;
+  singleLine?: boolean; // DAW mode: render all measures on one line
+  compactHeight?: boolean; // Reduce vertical spacing
 }
 
 // Staff line MIDI values (for treble clef)
@@ -38,7 +42,11 @@ export function ScoreDisplay({
   onStopNote,
   beatsPerMeasure = 4,
   keySignature = 'C',
-  onSeek
+  onSeek,
+  label,
+  labelColor = '#6b7280',
+  singleLine = false,
+  compactHeight = false,
 }: ScoreDisplayProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [isRendering, setIsRendering] = useState(false);
@@ -77,12 +85,17 @@ export function ScoreDisplay({
           width: containerRef.current.clientWidth || 800,
           beatsPerMeasure,
           keySignature,
+          singleLine,
+          compactHeight,
         });
 
         // Make notes interactive after rendering
         if (containerRef.current) {
           makeNotesInteractive(containerRef.current);
           extractStaffInfo(containerRef.current);
+          if (label) {
+            addLabelsToStaves(containerRef.current);
+          }
         }
 
         setIsRendering(false);
@@ -100,7 +113,7 @@ export function ScoreDisplay({
     return () => {
       cancelled = true;
     };
-  }, [measures, allNotes.length, beatsPerMeasure, keySignature, editMode]);
+  }, [measures, allNotes.length, beatsPerMeasure, keySignature, editMode, singleLine, compactHeight]);
 
   const makeNotesInteractive = useCallback((container: HTMLDivElement) => {
     const noteElements = container.querySelectorAll('.vf-stavenote');
@@ -157,6 +170,47 @@ export function ScoreDisplay({
       });
     }
   }, []);
+
+  // Add labels to each staff line
+  const addLabelsToStaves = useCallback((container: HTMLDivElement) => {
+    if (!label) return;
+
+    const svg = container.querySelector('svg');
+    if (!svg) return;
+
+    // Remove existing labels first
+    container.querySelectorAll('.voice-label').forEach(el => el.remove());
+
+    // Find all stave groups (each line of music)
+    const staveGroups = container.querySelectorAll('.vf-stave');
+    const processedYPositions = new Set<number>();
+
+    staveGroups.forEach((stave) => {
+      const staveLines = stave.querySelectorAll('line');
+      if (staveLines.length < 5) return;
+
+      // Get the Y position of the middle line of this staff
+      const middleLineY = parseFloat(staveLines[2]?.getAttribute('y1') || '0');
+
+      // Round to avoid duplicates from floating point
+      const roundedY = Math.round(middleLineY);
+      if (processedYPositions.has(roundedY)) return;
+      processedYPositions.add(roundedY);
+
+      // Create text element for the label
+      const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      text.setAttribute('x', '5');
+      text.setAttribute('y', String(middleLineY + 4)); // Center vertically on middle line
+      text.setAttribute('font-size', '11');
+      text.setAttribute('font-family', 'system-ui, -apple-system, sans-serif');
+      text.setAttribute('font-weight', '500');
+      text.setAttribute('fill', labelColor);
+      text.setAttribute('class', 'voice-label');
+      text.textContent = label;
+
+      svg.appendChild(text);
+    });
+  }, [label, labelColor]);
 
   // Highlight current/selected note
   useEffect(() => {
@@ -352,7 +406,11 @@ export function ScoreDisplay({
   }
 
   return (
-    <div className="w-full bg-white rounded-lg border border-zinc-200 dark:border-zinc-700 p-4 overflow-x-auto relative">
+    <div className={`w-full relative ${
+      compactHeight
+        ? 'bg-white'
+        : 'bg-white rounded-lg border border-zinc-200 dark:border-zinc-700 p-4 overflow-x-auto'
+    }`}>
       {isRendering && (
         <div className="absolute inset-0 flex items-center justify-center bg-white/50 z-10">
           <div className="animate-pulse text-zinc-500">Rendering score...</div>

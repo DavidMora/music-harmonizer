@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { AudioUploader } from '@/components/AudioUploader';
 import { ProcessingStatus } from '@/components/ProcessingStatus';
 import { ScoreDisplay } from '@/components/ScoreDisplay';
@@ -11,8 +11,11 @@ import { usePlayback } from '@/hooks/usePlayback';
 import { useAudioContext } from '@/context/AudioContextProvider';
 import { quantizeNotes, groupIntoMeasures } from '@/lib/notation/quantizer';
 import { loadInstrument } from '@/lib/playback/soundfontPlayer';
-import { downloadMidi } from '@/lib/midi/midiExporter';
+import { downloadMidi, downloadMidiWithHarmony } from '@/lib/midi/midiExporter';
 import { parseMidiFile } from '@/lib/midi/midiImporter';
+import { generateHarmony, combineVoicesForPlayback, HARMONY_STYLES } from '@/lib/harmony/harmonizer';
+import type { HarmonyStyle, HarmonyVoice } from '@/lib/harmony/harmonizer';
+import { HarmonyPanel } from '@/components/HarmonyPanel';
 import type { NoteEvent, QuantizedNote, NoteDuration } from '@/types/music';
 import { midiToNoteName } from '@/types/music';
 import type Soundfont from 'soundfont-player';
@@ -71,6 +74,30 @@ function getScaleNotes(key: string): Set<number> {
   return scaleNotes;
 }
 
+// Find the note index that is playing at a given time
+function findNoteIndexAtTime(notes: NoteEvent[], currentTime: number): number {
+  if (notes.length === 0 || currentTime < 0) return -1;
+
+  for (let i = notes.length - 1; i >= 0; i--) {
+    const note = notes[i];
+    if (currentTime >= note.startTime && currentTime < note.startTime + note.duration) {
+      return i;
+    }
+    // If we've passed this note, check if we're between notes
+    if (currentTime >= note.startTime + note.duration) {
+      // Return the last note that has started
+      for (let j = i; j < notes.length; j++) {
+        if (notes[j].startTime <= currentTime) {
+          return j;
+        }
+      }
+      return i;
+    }
+  }
+
+  return -1;
+}
+
 function snapToKey(midi: number, key: string): number {
   const scaleNotes = getScaleNotes(key);
   const noteInOctave = midi % 12;
@@ -107,8 +134,47 @@ export default function Home() {
   const [selectedNoteIndex, setSelectedNoteIndex] = useState<number | null>(null);
   const [inputDuration, setInputDuration] = useState<NoteDuration>('quarter');
 
+  // Harmony state
+  const [harmonyStyle, setHarmonyStyle] = useState<HarmonyStyle | null>(null);
+  const [harmonyVoices, setHarmonyVoices] = useState<HarmonyVoice[]>([]);
+  const [harmonyMeasures, setHarmonyMeasures] = useState<QuantizedNote[][][]>([]); // measures per voice
+  const [voiceEnabled, setVoiceEnabled] = useState<boolean[]>([]);
+  const [isMinorKey, setIsMinorKey] = useState(false);
+  const [leadVoiceEnabled, setLeadVoiceEnabled] = useState(true);
+
+  // Generate harmony when style, notes, key, or minor mode changes
+  useEffect(() => {
+    if (!harmonyStyle || notes.length === 0) {
+      setHarmonyVoices([]);
+      setHarmonyMeasures([]);
+      setVoiceEnabled([]);
+      return;
+    }
+
+    const result = generateHarmony(notes, harmonyStyle, keySignature, isMinorKey);
+    setHarmonyVoices(result.voices);
+    setVoiceEnabled(result.voices.map(() => true)); // Enable all voices by default
+
+    // Quantize each harmony voice into measures
+    const voiceMeasures = result.voices.map(voice => {
+      const quantized = quantizeNotes(voice.notes, { tempo, minQuantization, keySignature });
+      return groupIntoMeasures(quantized, beatsPerMeasure);
+    });
+    setHarmonyMeasures(voiceMeasures);
+  }, [harmonyStyle, notes, keySignature, isMinorKey, tempo, minQuantization, beatsPerMeasure]);
+
+  // Combine melody with enabled harmony voices for playback
+  const playbackNotes = useMemo(() => {
+    const enabledVoices = harmonyVoices.filter((_, i) => voiceEnabled[i]);
+    return combineVoicesForPlayback(
+      leadVoiceEnabled ? notes : [],
+      enabledVoices,
+      leadVoiceEnabled
+    );
+  }, [notes, harmonyVoices, voiceEnabled, leadVoiceEnabled]);
+
   const { analyze, isAnalyzing, progress, error } = useAudioAnalysis();
-  const { play, playFrom, stop, toggle, setTempo: setPlaybackTempo, setCursorPosition, playbackState, cursorPosition, isLoading } = usePlayback(notes);
+  const { play, playFrom, stop, toggle, setTempo: setPlaybackTempo, setCursorPosition, playbackState, cursorPosition, isLoading } = usePlayback(playbackNotes);
   const { getAudioContext, resumeContext } = useAudioContext();
 
   const previewInstrumentRef = useRef<Soundfont.Player | null>(null);
@@ -330,6 +396,34 @@ export default function Home() {
     const filename = fileName ? fileName.replace(/\.[^/.]+$/, '.mid') : 'composition.mid';
     downloadMidi(notes, tempo, filename);
   }, [notes, tempo, fileName]);
+
+  // Handle harmony style change
+  const handleHarmonyStyleChange = useCallback((style: HarmonyStyle | null) => {
+    setHarmonyStyle(style);
+  }, []);
+
+  // Handle toggling harmony voices
+  const handleToggleVoice = useCallback((index: number) => {
+    setVoiceEnabled(prev => {
+      const updated = [...prev];
+      updated[index] = !updated[index];
+      return updated;
+    });
+  }, []);
+
+  // Handle harmony MIDI download
+  const handleDownloadHarmony = useCallback(() => {
+    if (notes.length === 0 || harmonyVoices.length === 0) return;
+
+    // Filter to only enabled voices
+    const enabledVoices = harmonyVoices.filter((_, i) => voiceEnabled[i]);
+    if (enabledVoices.length === 0) return;
+
+    const filename = fileName
+      ? fileName.replace(/\.[^/.]+$/, '_harmony.mid')
+      : 'harmony.mid';
+    downloadMidiWithHarmony(notes, enabledVoices, tempo, filename);
+  }, [notes, harmonyVoices, voiceEnabled, tempo, fileName]);
 
   // Handle transpose (change key)
   const handleTranspose = useCallback((semitones: number) => {
@@ -576,6 +670,21 @@ export default function Home() {
           </div>
         </section>
 
+        {/* Harmony Panel */}
+        <HarmonyPanel
+          harmonyStyle={harmonyStyle}
+          onStyleChange={handleHarmonyStyleChange}
+          harmonyVoices={harmonyVoices}
+          onToggleVoice={handleToggleVoice}
+          voiceEnabled={voiceEnabled}
+          onDownloadHarmony={handleDownloadHarmony}
+          hasNotes={notes.length > 0}
+          isMinor={isMinorKey}
+          onMinorChange={setIsMinorKey}
+          leadVoiceEnabled={leadVoiceEnabled}
+          onLeadVoiceToggle={() => setLeadVoiceEnabled(!leadVoiceEnabled)}
+        />
+
         {/* Upload Section */}
         <section className="mb-6">
           <AudioUploader onFileSelect={handleFileSelect} onMidiSelect={handleMidiSelect} disabled={isAnalyzing} />
@@ -606,25 +715,90 @@ export default function Home() {
           />
         </section>
 
-        {/* Score Display */}
+        {/* DAW-Style Multi-Track Score Display */}
         <section className="mb-6">
-          <ScoreDisplay
-            measures={measures}
-            currentNoteIndex={playbackState.isPlaying ? playbackState.currentNoteIndex : cursorPosition}
-            isPlaying={playbackState.isPlaying}
-            selectedNoteIndex={selectedNoteIndex}
-            editMode={editMode}
-            inputDuration={inputDuration}
-            onNoteChange={handleNoteChange}
-            onNoteSelect={handleNoteSelect}
-            onNoteAdd={handleNoteAdd}
-            onPlayNote={playPreviewNote}
-            onStopNote={stopPreviewNote}
-            beatsPerMeasure={beatsPerMeasure}
-            keySignature={keySignature}
-            onSeek={handleSeek}
-          />
+          <div className="rounded-lg border border-zinc-300 dark:border-zinc-600 overflow-hidden">
+            {/* Track container with horizontal scrolling */}
+            <div className="overflow-x-auto bg-white">
+              {/* All tracks stacked vertically */}
+              <div className="min-w-max">
+                {/* Lead Voice Track */}
+                {leadVoiceEnabled && (
+                  <div className="flex border-b border-zinc-200">
+                    <div className="w-28 flex-shrink-0 bg-zinc-50 p-2 flex items-center gap-2 border-r border-zinc-200">
+                      <span className="w-3 h-3 rounded-full bg-blue-500" />
+                      <span className="text-xs font-medium text-zinc-700 truncate">Lead Voice</span>
+                    </div>
+                    <div className="flex-1 bg-white">
+                      <ScoreDisplay
+                        measures={measures}
+                        currentNoteIndex={
+                          playbackState.isPlaying
+                            ? findNoteIndexAtTime(notes, playbackState.currentTime)
+                            : cursorPosition
+                        }
+                        isPlaying={playbackState.isPlaying}
+                        selectedNoteIndex={selectedNoteIndex}
+                        editMode={editMode}
+                        inputDuration={inputDuration}
+                        onNoteChange={handleNoteChange}
+                        onNoteSelect={handleNoteSelect}
+                        onNoteAdd={handleNoteAdd}
+                        onPlayNote={playPreviewNote}
+                        onStopNote={stopPreviewNote}
+                        beatsPerMeasure={beatsPerMeasure}
+                        keySignature={keySignature}
+                        onSeek={handleSeek}
+                        singleLine={true}
+                        compactHeight={true}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Harmony Voice Tracks */}
+                {harmonyVoices.map((voice, index) => {
+                  if (!voiceEnabled[index] || !harmonyMeasures[index]) return null;
+                  const voiceMeasures = harmonyMeasures[index];
+                  const voiceNotes = voice.notes;
+                  return (
+                    <div key={`harmony-${index}`} className="flex border-b border-zinc-200 last:border-b-0">
+                      <div className="w-28 flex-shrink-0 bg-zinc-50 p-2 flex items-center gap-2 border-r border-zinc-200">
+                        <span className="w-3 h-3 rounded-full" style={{ backgroundColor: voice.color }} />
+                        <span className="text-xs font-medium text-zinc-700 truncate">{voice.name}</span>
+                      </div>
+                      <div className="flex-1 bg-white">
+                        <ScoreDisplay
+                          measures={voiceMeasures}
+                          currentNoteIndex={
+                            playbackState.isPlaying
+                              ? findNoteIndexAtTime(voiceNotes, playbackState.currentTime)
+                              : -1
+                          }
+                          isPlaying={playbackState.isPlaying}
+                          selectedNoteIndex={null}
+                          editMode="select"
+                          inputDuration={inputDuration}
+                          onNoteChange={() => {}}
+                          onNoteSelect={() => {}}
+                          onNoteAdd={() => {}}
+                          onPlayNote={playPreviewNote}
+                          onStopNote={stopPreviewNote}
+                          beatsPerMeasure={beatsPerMeasure}
+                          keySignature={keySignature}
+                          onSeek={() => {}}
+                          singleLine={true}
+                          compactHeight={true}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
         </section>
+
 
         {/* Notes Info */}
         {notes.length > 0 && (

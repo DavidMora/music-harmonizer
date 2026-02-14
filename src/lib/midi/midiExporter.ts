@@ -1,12 +1,112 @@
 import type { NoteEvent } from '@/types/music';
+import type { HarmonyVoice } from '@/lib/harmony/harmonizer';
+
+interface MidiTrack {
+  name: string;
+  notes: NoteEvent[];
+  channel: number;
+  program: number; // MIDI program/instrument number
+}
 
 /**
- * Generate a MIDI file from note events
+ * Generate a MIDI file from note events (single track)
  * Returns a Blob that can be downloaded
  */
 export function generateMidiFile(notes: NoteEvent[], tempo: number = 120): Blob {
-  const ticksPerBeat = 480; // Standard MIDI resolution
+  return generateMultiTrackMidiFile(
+    [{ name: 'Melody', notes, channel: 0, program: 0 }],
+    tempo
+  );
+}
+
+/**
+ * Generate a multi-track MIDI file from melody and harmony voices
+ */
+export function generateMultiTrackMidiFile(
+  tracks: MidiTrack[],
+  tempo: number = 120
+): Blob {
+  const ticksPerBeat = 480;
   const microsecondsPerBeat = Math.round(60000000 / tempo);
+
+  // Build all track data
+  const trackDataArray: number[][] = [];
+
+  // First track: tempo and time signature (conductor track for format 1)
+  const conductorTrack: number[] = [];
+
+  // Tempo meta event
+  conductorTrack.push(0x00); // Delta time
+  conductorTrack.push(0xFF, 0x51, 0x03);
+  conductorTrack.push((microsecondsPerBeat >> 16) & 0xFF);
+  conductorTrack.push((microsecondsPerBeat >> 8) & 0xFF);
+  conductorTrack.push(microsecondsPerBeat & 0xFF);
+
+  // Time signature meta event
+  conductorTrack.push(0x00);
+  conductorTrack.push(0xFF, 0x58, 0x04);
+  conductorTrack.push(0x04, 0x02, 0x18, 0x08);
+
+  // End of track
+  conductorTrack.push(0x00);
+  conductorTrack.push(0xFF, 0x2F, 0x00);
+
+  trackDataArray.push(conductorTrack);
+
+  // Build each instrument track
+  for (const track of tracks) {
+    const trackData = buildTrackData(track, ticksPerBeat, tempo);
+    trackDataArray.push(trackData);
+  }
+
+  // Build complete MIDI file
+  const midiData: number[] = [];
+
+  // Header chunk - Format 1 (multiple tracks, synchronous)
+  midiData.push(0x4D, 0x54, 0x68, 0x64); // "MThd"
+  midiData.push(0x00, 0x00, 0x00, 0x06); // Chunk length (6)
+  midiData.push(0x00, 0x01); // Format type 1
+  const numTracks = trackDataArray.length;
+  midiData.push((numTracks >> 8) & 0xFF, numTracks & 0xFF); // Number of tracks
+  midiData.push((ticksPerBeat >> 8) & 0xFF, ticksPerBeat & 0xFF); // Ticks per beat
+
+  // Add all track chunks
+  for (const trackData of trackDataArray) {
+    midiData.push(0x4D, 0x54, 0x72, 0x6B); // "MTrk"
+    const trackLength = trackData.length;
+    midiData.push((trackLength >> 24) & 0xFF);
+    midiData.push((trackLength >> 16) & 0xFF);
+    midiData.push((trackLength >> 8) & 0xFF);
+    midiData.push(trackLength & 0xFF);
+    midiData.push(...trackData);
+  }
+
+  return new Blob([new Uint8Array(midiData)], { type: 'audio/midi' });
+}
+
+/**
+ * Build track data for a single track
+ */
+function buildTrackData(
+  track: MidiTrack,
+  ticksPerBeat: number,
+  tempo: number
+): number[] {
+  const trackData: number[] = [];
+  const { notes, channel, program, name } = track;
+
+  // Track name meta event
+  if (name) {
+    trackData.push(0x00); // Delta time
+    trackData.push(0xFF, 0x03); // Track name
+    const nameBytes = new TextEncoder().encode(name);
+    writeVariableLength(trackData, nameBytes.length);
+    trackData.push(...nameBytes);
+  }
+
+  // Program change
+  trackData.push(0x00); // Delta time
+  trackData.push(0xC0 | (channel & 0x0F), program & 0x7F);
 
   // Sort notes by start time
   const sortedNotes = [...notes].sort((a, b) => a.startTime - b.startTime);
@@ -46,7 +146,7 @@ export function generateMidiFile(notes: NoteEvent[], tempo: number = 120): Blob 
     });
   }
 
-  // Sort events by tick, with noteOff before noteOn at same tick
+  // Sort events
   events.sort((a, b) => {
     if (a.tick !== b.tick) return a.tick - b.tick;
     if (a.type === 'noteOff' && b.type === 'noteOn') return -1;
@@ -54,81 +154,30 @@ export function generateMidiFile(notes: NoteEvent[], tempo: number = 120): Blob 
     return 0;
   });
 
-  // Build track data
-  const trackData: number[] = [];
-
-  // Tempo meta event (FF 51 03 tt tt tt)
-  trackData.push(0x00); // Delta time
-  trackData.push(0xFF, 0x51, 0x03);
-  trackData.push((microsecondsPerBeat >> 16) & 0xFF);
-  trackData.push((microsecondsPerBeat >> 8) & 0xFF);
-  trackData.push(microsecondsPerBeat & 0xFF);
-
-  // Time signature meta event (FF 58 04 nn dd cc bb)
-  trackData.push(0x00); // Delta time
-  trackData.push(0xFF, 0x58, 0x04);
-  trackData.push(0x04); // Numerator (4)
-  trackData.push(0x02); // Denominator as power of 2 (4 = 2^2)
-  trackData.push(0x18); // MIDI clocks per metronome click (24)
-  trackData.push(0x08); // 32nd notes per quarter note (8)
-
-  // Program change to acoustic grand piano
-  trackData.push(0x00); // Delta time
-  trackData.push(0xC0, 0x00); // Channel 0, Program 0 (piano)
-
   // Add note events
   let lastTick = 0;
   for (const event of events) {
     const deltaTick = event.tick - lastTick;
     lastTick = event.tick;
 
-    // Write variable-length delta time
     writeVariableLength(trackData, deltaTick);
 
-    // Write MIDI event
     if (event.type === 'noteOn') {
-      trackData.push(0x90); // Note on, channel 0
+      trackData.push(0x90 | (channel & 0x0F));
       trackData.push(event.note & 0x7F);
       trackData.push(event.velocity & 0x7F);
     } else {
-      trackData.push(0x80); // Note off, channel 0
+      trackData.push(0x80 | (channel & 0x0F));
       trackData.push(event.note & 0x7F);
       trackData.push(0x00);
     }
   }
 
-  // End of track meta event
-  trackData.push(0x00); // Delta time
+  // End of track
+  trackData.push(0x00);
   trackData.push(0xFF, 0x2F, 0x00);
 
-  // Build complete MIDI file
-  const midiData: number[] = [];
-
-  // Header chunk
-  // "MThd"
-  midiData.push(0x4D, 0x54, 0x68, 0x64);
-  // Chunk length (6)
-  midiData.push(0x00, 0x00, 0x00, 0x06);
-  // Format type (0 = single track)
-  midiData.push(0x00, 0x00);
-  // Number of tracks (1)
-  midiData.push(0x00, 0x01);
-  // Ticks per beat
-  midiData.push((ticksPerBeat >> 8) & 0xFF, ticksPerBeat & 0xFF);
-
-  // Track chunk
-  // "MTrk"
-  midiData.push(0x4D, 0x54, 0x72, 0x6B);
-  // Track length
-  const trackLength = trackData.length;
-  midiData.push((trackLength >> 24) & 0xFF);
-  midiData.push((trackLength >> 16) & 0xFF);
-  midiData.push((trackLength >> 8) & 0xFF);
-  midiData.push(trackLength & 0xFF);
-  // Track data
-  midiData.push(...trackData);
-
-  return new Blob([new Uint8Array(midiData)], { type: 'audio/midi' });
+  return trackData;
 }
 
 /**
@@ -145,25 +194,56 @@ function writeVariableLength(data: number[], value: number): void {
     bytes.push((value & 0x7F) | 0x80);
   }
 
-  // Write in reverse order
   for (let i = bytes.length - 1; i >= 0; i--) {
     data.push(bytes[i]);
   }
 }
 
 /**
- * Trigger download of MIDI file
+ * Trigger download of MIDI file (single track)
  */
 export function downloadMidi(notes: NoteEvent[], tempo: number, filename: string = 'composition.mid'): void {
   const blob = generateMidiFile(notes, tempo);
-  const url = URL.createObjectURL(blob);
+  downloadBlob(blob, filename);
+}
 
+/**
+ * Trigger download of multi-track MIDI file with harmony
+ */
+export function downloadMidiWithHarmony(
+  melody: NoteEvent[],
+  harmonyVoices: HarmonyVoice[],
+  tempo: number,
+  filename: string = 'harmony.mid'
+): void {
+  const tracks: MidiTrack[] = [
+    { name: 'Melody', notes: melody, channel: 0, program: 0 }
+  ];
+
+  // Add harmony voices on different channels
+  harmonyVoices.forEach((voice, index) => {
+    tracks.push({
+      name: voice.name,
+      notes: voice.notes,
+      channel: (index + 1) % 16, // Avoid channel 9 (drums)
+      program: 0, // Piano for all voices
+    });
+  });
+
+  const blob = generateMultiTrackMidiFile(tracks, tempo);
+  downloadBlob(blob, filename);
+}
+
+/**
+ * Helper to download a blob
+ */
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-
   URL.revokeObjectURL(url);
 }

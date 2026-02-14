@@ -30,6 +30,8 @@ interface RenderOptions {
   width?: number;
   beatsPerMeasure?: number;
   keySignature?: string;
+  singleLine?: boolean; // DAW mode: render all measures on one horizontal line
+  compactHeight?: boolean; // Reduce vertical spacing for multi-track view
 }
 
 export async function renderScore(
@@ -40,7 +42,7 @@ export async function renderScore(
   const VexFlow = await import('vexflow');
   const { Renderer, Stave, StaveNote, Voice, Formatter, Accidental, BarlineType, Dot } = VexFlow.default;
 
-  const { width = 800, beatsPerMeasure = 4, keySignature = 'C' } = options;
+  const { width = 800, beatsPerMeasure = 4, keySignature = 'C', singleLine = false, compactHeight = false } = options;
 
   container.innerHTML = '';
 
@@ -79,46 +81,68 @@ export async function renderScore(
   }
 
   const lines: LineInfo[] = [];
-  let currentLine: LineInfo = { measureIndices: [], totalWidth: clefKeyTimeWidth };
 
-  for (let i = 0; i < measures.length; i++) {
-    const neededWidth = measureWidths[i];
-    const isFirstLine = lines.length === 0;
-    const lineStartWidth = isFirstLine ? clefKeyTimeWidth : clefWidth;
+  if (singleLine) {
+    // DAW mode: all measures on one line
+    const totalMeasureWidth = measureWidths.reduce((sum, w) => sum + w, 0);
+    lines.push({
+      measureIndices: measures.map((_, i) => i),
+      totalWidth: clefKeyTimeWidth + totalMeasureWidth,
+    });
+  } else {
+    // Normal mode: wrap lines based on available width
+    let currentLine: LineInfo = { measureIndices: [], totalWidth: clefKeyTimeWidth };
 
-    // Check if measure fits on current line
-    if (currentLine.measureIndices.length === 0) {
-      // First measure on line always fits
-      currentLine.measureIndices.push(i);
-      currentLine.totalWidth = lineStartWidth + neededWidth;
-    } else if (currentLine.totalWidth + neededWidth <= availableLineWidth) {
-      // Measure fits
-      currentLine.measureIndices.push(i);
-      currentLine.totalWidth += neededWidth;
-    } else {
-      // Start new line
+    for (let i = 0; i < measures.length; i++) {
+      const neededWidth = measureWidths[i];
+      const isFirstLine = lines.length === 0;
+      const lineStartWidth = isFirstLine ? clefKeyTimeWidth : clefWidth;
+
+      // Check if measure fits on current line
+      if (currentLine.measureIndices.length === 0) {
+        // First measure on line always fits
+        currentLine.measureIndices.push(i);
+        currentLine.totalWidth = lineStartWidth + neededWidth;
+      } else if (currentLine.totalWidth + neededWidth <= availableLineWidth) {
+        // Measure fits
+        currentLine.measureIndices.push(i);
+        currentLine.totalWidth += neededWidth;
+      } else {
+        // Start new line
+        lines.push(currentLine);
+        currentLine = {
+          measureIndices: [i],
+          totalWidth: clefWidth + neededWidth,
+        };
+      }
+    }
+
+    // Don't forget the last line
+    if (currentLine.measureIndices.length > 0) {
       lines.push(currentLine);
-      currentLine = {
-        measureIndices: [i],
-        totalWidth: clefWidth + neededWidth,
-      };
     }
   }
 
-  // Don't forget the last line
-  if (currentLine.measureIndices.length > 0) {
-    lines.push(currentLine);
-  }
-
   // Calculate total height
-  const lineHeight = 120;
-  const topMargin = 30;
-  const totalHeight = topMargin + lines.length * lineHeight + 20;
+  const lineHeight = compactHeight ? 110 : 120;
+  const topMargin = compactHeight ? 25 : 30;
+  const totalHeight = topMargin + lines.length * lineHeight + (compactHeight ? 25 : 20);
+
+  // Calculate actual width needed
+  const actualWidth = singleLine ? lines[0].totalWidth + lineMargin : width;
 
   const renderer = new Renderer(container, Renderer.Backends.SVG);
-  renderer.resize(width, totalHeight);
+  renderer.resize(actualWidth, totalHeight);
   const context = renderer.getContext();
   context.setFont('Arial', 10);
+
+  // Set default colors - black notes on white background
+  const svg = container.querySelector('svg');
+  if (svg) {
+    svg.style.backgroundColor = 'white';
+  }
+  context.setFillStyle('#000000');
+  context.setStrokeStyle('#000000');
 
   // Render each line
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
@@ -126,9 +150,9 @@ export async function renderScore(
     const yPosition = topMargin + lineIndex * lineHeight;
     const isFirstLine = lineIndex === 0;
 
-    // Calculate scale factor to fill the line width (but don't squeeze too much)
-    const targetWidth = availableLineWidth;
-    const scaleFactor = Math.min(1.3, targetWidth / line.totalWidth);
+    // In singleLine mode, don't scale - use natural widths
+    // In normal mode, scale to fill available width
+    const lineScale = singleLine ? 1 : Math.min(1.3, availableLineWidth / line.totalWidth);
 
     let xPosition = 10;
 
@@ -139,24 +163,13 @@ export async function renderScore(
       const isLastMeasure = measureIndex === measures.length - 1;
 
       // Calculate measure width
-      let measureWidth = measureWidths[measureIndex] * scaleFactor;
-      if (isFirstInLine) {
-        measureWidth += (isFirstLine ? clefKeyTimeWidth : clefWidth) * (scaleFactor - 1);
-        if (isFirstLine) {
-          measureWidth = measureWidths[measureIndex] * scaleFactor + clefKeyTimeWidth * (1 - 1/scaleFactor);
-        }
-      }
-
-      // Recalculate to distribute width evenly
+      let measureWidth = measureWidths[measureIndex];
       if (isFirstInLine) {
         const extraWidth = isFirstLine ? clefKeyTimeWidth : clefWidth;
         measureWidth = measureWidths[measureIndex] + extraWidth;
-      } else {
-        measureWidth = measureWidths[measureIndex];
       }
 
-      // Scale to fill line
-      const lineScale = targetWidth / line.totalWidth;
+      // Scale (only in non-singleLine mode)
       measureWidth *= lineScale;
 
       // Create stave
