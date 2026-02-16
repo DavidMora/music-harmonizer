@@ -2,9 +2,17 @@ import type { NoteEvent, QuantizedNote, NoteDuration } from '@/types/music';
 import { midiToNoteName } from '@/types/music';
 
 export interface QuantizerOptions {
-  tempo: number; // BPM
+  tempo?: number;              // BPM (uses detected tempo if not provided)
+  detectedTempo?: number;      // Auto-detected tempo from analysis
+  tempoConfidence?: number;    // Confidence of detected tempo (0-1)
+  onsets?: number[];           // Onset times for alignment
   minQuantization?: NoteDuration; // Minimum note duration
-  keySignature?: string; // Key signature for note spelling
+  keySignature?: string;       // Key signature for note spelling
+  preserveVelocity?: boolean;  // Preserve velocity in output
+}
+
+export interface QuantizedNoteWithVelocity extends QuantizedNote {
+  velocity?: number;
 }
 
 // Duration values in beats (including dotted notes)
@@ -35,12 +43,29 @@ const MIN_QUANT_INDEX: Record<string, number> = {
   'sixteenth': 8,  // sixteenth only
 };
 
+/**
+ * Quantize notes to musical notation values
+ * Now supports automatic tempo detection and onset-aligned boundaries
+ */
 export function quantizeNotes(
   notes: NoteEvent[],
   options: QuantizerOptions
-): QuantizedNote[] {
-  const { tempo, minQuantization = 'sixteenth', keySignature } = options;
-  const secondsPerBeat = 60 / tempo;
+): QuantizedNoteWithVelocity[] {
+  const {
+    tempo,
+    detectedTempo,
+    tempoConfidence = 0,
+    onsets,
+    minQuantization = 'sixteenth',
+    keySignature,
+    preserveVelocity = true,
+  } = options;
+
+  // Use detected tempo if available and confident, otherwise use provided tempo or default
+  const effectiveTempo = selectTempo(tempo, detectedTempo, tempoConfidence);
+  const secondsPerBeat = 60 / effectiveTempo;
+
+  console.log(`Quantizing with tempo: ${effectiveTempo} BPM`);
 
   // Determine minimum quantization level index
   const minQuantBase = minQuantization.replace('-dotted', '') as string;
@@ -49,10 +74,21 @@ export function quantizeNotes(
   // Get allowed durations (all durations up to and including min quantization)
   const allowedDurations = DURATION_ORDER.slice(0, minIndex + 1);
 
+  // Build onset lookup for alignment
+  const onsetSet = new Set(onsets?.map(o => Math.round(o * 1000)) ?? []);
+
   return notes.map((note) => {
     // Convert time to beats
-    const startBeat = note.startTime / secondsPerBeat;
+    let startBeat = note.startTime / secondsPerBeat;
     const durationBeats = note.duration / secondsPerBeat;
+
+    // If onsets provided, try to align to onset-detected boundaries
+    if (onsets && onsets.length > 0) {
+      const alignedStart = alignToOnset(note.startTime, onsets, 0.05);
+      if (alignedStart !== null) {
+        startBeat = alignedStart / secondsPerBeat;
+      }
+    }
 
     // Quantize start time to nearest grid position based on min quantization
     const gridSize = DURATION_VALUES[minQuantization.replace('-dotted', '') as NoteDuration] || 0.25;
@@ -61,14 +97,65 @@ export function quantizeNotes(
     // Find best matching duration
     const quantizedDuration = findBestDuration(durationBeats, allowedDurations);
 
-    return {
+    const result: QuantizedNoteWithVelocity = {
       midi: note.midi,
       noteName: midiToNoteName(note.midi, keySignature),
       duration: quantizedDuration.name,
       durationBeats: quantizedDuration.beats,
       startBeat: quantizedStartBeat,
     };
+
+    // Preserve velocity if requested
+    if (preserveVelocity && note.velocity !== undefined) {
+      result.velocity = note.velocity;
+    }
+
+    return result;
   });
+}
+
+/**
+ * Select the best tempo to use
+ */
+function selectTempo(
+  providedTempo: number | undefined,
+  detectedTempo: number | undefined,
+  confidence: number
+): number {
+  // If user provided a specific tempo, use it
+  if (providedTempo !== undefined && providedTempo > 0) {
+    return providedTempo;
+  }
+
+  // If detected tempo has good confidence, use it
+  if (detectedTempo !== undefined && detectedTempo > 0 && confidence >= 0.3) {
+    return detectedTempo;
+  }
+
+  // Fallback to default
+  return 120;
+}
+
+/**
+ * Align a time to the nearest onset within tolerance
+ */
+function alignToOnset(
+  time: number,
+  onsets: number[],
+  tolerance: number
+): number | null {
+  let closest: number | null = null;
+  let minDist = tolerance;
+
+  for (const onset of onsets) {
+    const dist = Math.abs(onset - time);
+    if (dist < minDist) {
+      minDist = dist;
+      closest = onset;
+    }
+  }
+
+  return closest;
 }
 
 function findBestDuration(
@@ -151,4 +238,43 @@ export function groupIntoMeasures(
   }
 
   return measures;
+}
+
+/**
+ * Estimate tempo from note durations
+ * Fallback when onset-based tempo detection isn't available
+ */
+export function estimateTempoFromNotes(notes: NoteEvent[]): number {
+  if (notes.length < 2) {
+    return 120;
+  }
+
+  // Calculate inter-note intervals
+  const intervals: number[] = [];
+  for (let i = 1; i < notes.length; i++) {
+    const interval = notes[i].startTime - notes[i - 1].startTime;
+    if (interval > 0.1 && interval < 2.0) {
+      intervals.push(interval);
+    }
+  }
+
+  if (intervals.length === 0) {
+    return 120;
+  }
+
+  // Find median interval
+  intervals.sort((a, b) => a - b);
+  const medianInterval = intervals[Math.floor(intervals.length / 2)];
+
+  // Assume median interval is a beat
+  const bpm = 60 / medianInterval;
+
+  // Normalize to reasonable range (60-180 BPM)
+  if (bpm < 60) {
+    return Math.round(bpm * 2);
+  } else if (bpm > 180) {
+    return Math.round(bpm / 2);
+  }
+
+  return Math.round(bpm);
 }

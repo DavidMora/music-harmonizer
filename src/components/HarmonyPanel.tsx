@@ -12,6 +12,7 @@ interface HarmonyPanelProps {
   voiceEnabled: boolean[];
   onDownloadHarmony: () => void;
   hasNotes: boolean;
+  hasChords: boolean;
   isMinor: boolean;
   onMinorChange: (isMinor: boolean) => void;
   leadVoiceEnabled: boolean;
@@ -26,11 +27,15 @@ export function HarmonyPanel({
   voiceEnabled,
   onDownloadHarmony,
   hasNotes,
+  hasChords,
   isMinor,
   onMinorChange,
   leadVoiceEnabled,
   onLeadVoiceToggle,
 }: HarmonyPanelProps) {
+  // Check if the current style requires chords
+  const currentStyleInfo = HARMONY_STYLES.find(s => s.value === harmonyStyle);
+  const needsChords = currentStyleInfo?.requiresChords && !hasChords;
   const [isExpanded, setIsExpanded] = useState(true);
 
   return (
@@ -111,6 +116,13 @@ export function HarmonyPanel({
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               {HARMONY_STYLES.find(s => s.value === harmonyStyle)?.description}
             </p>
+          )}
+
+          {/* Warning when chord-based style selected but no chords */}
+          {needsChords && (
+            <div className="p-2 bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-800 rounded text-sm text-amber-700 dark:text-amber-300">
+              This harmony style requires a chord progression. Add chords in the Chord track below.
+            </div>
           )}
 
           {/* Voice Controls */}

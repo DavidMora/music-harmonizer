@@ -16,8 +16,10 @@ import { parseMidiFile } from '@/lib/midi/midiImporter';
 import { generateHarmony, combineVoicesForPlayback, HARMONY_STYLES } from '@/lib/harmony/harmonizer';
 import type { HarmonyStyle, HarmonyVoice } from '@/lib/harmony/harmonizer';
 import { HarmonyPanel } from '@/components/HarmonyPanel';
-import type { NoteEvent, QuantizedNote, NoteDuration } from '@/types/music';
+import { ChordTrack } from '@/components/ChordTrack';
+import type { NoteEvent, QuantizedNote, NoteDuration, ChordEvent } from '@/types/music';
 import { midiToNoteName } from '@/types/music';
+import { suggestChords, chordToNoteEvents } from '@/lib/harmony/chords';
 import type Soundfont from 'soundfont-player';
 
 const QUANTIZATION_OPTIONS: { value: NoteDuration; label: string }[] = [
@@ -142,7 +144,11 @@ export default function Home() {
   const [isMinorKey, setIsMinorKey] = useState(false);
   const [leadVoiceEnabled, setLeadVoiceEnabled] = useState(true);
 
-  // Generate harmony when style, notes, key, or minor mode changes
+  // Chord track state
+  const [chords, setChords] = useState<ChordEvent[]>([]);
+  const [chordsEnabled, setChordsEnabled] = useState(true);
+
+  // Generate harmony when style, notes, key, minor mode, or chords change
   useEffect(() => {
     if (!harmonyStyle || notes.length === 0) {
       setHarmonyVoices([]);
@@ -151,7 +157,8 @@ export default function Home() {
       return;
     }
 
-    const result = generateHarmony(notes, harmonyStyle, keySignature, isMinorKey);
+    // Pass chords to harmony generation for chord-based styles
+    const result = generateHarmony(notes, harmonyStyle, keySignature, isMinorKey, chords, tempo);
     setHarmonyVoices(result.voices);
     setVoiceEnabled(result.voices.map(() => true)); // Enable all voices by default
 
@@ -161,17 +168,27 @@ export default function Home() {
       return groupIntoMeasures(quantized, beatsPerMeasure);
     });
     setHarmonyMeasures(voiceMeasures);
-  }, [harmonyStyle, notes, keySignature, isMinorKey, tempo, minQuantization, beatsPerMeasure]);
+  }, [harmonyStyle, notes, keySignature, isMinorKey, tempo, minQuantization, beatsPerMeasure, chords]);
 
-  // Combine melody with enabled harmony voices for playback
+  // Combine melody with enabled harmony voices and chords for playback
   const playbackNotes = useMemo(() => {
     const enabledVoices = harmonyVoices.filter((_, i) => voiceEnabled[i]);
-    return combineVoicesForPlayback(
+    let combined = combineVoicesForPlayback(
       leadVoiceEnabled ? notes : [],
       enabledVoices,
       leadVoiceEnabled
     );
-  }, [notes, harmonyVoices, voiceEnabled, leadVoiceEnabled]);
+
+    // Add chord notes if enabled
+    if (chordsEnabled && chords.length > 0) {
+      const chordNotes = chords.flatMap(chord =>
+        chordToNoteEvents(chord, tempo, 3, 60) // octave 3, velocity 60
+      );
+      combined = [...combined, ...chordNotes].sort((a, b) => a.startTime - b.startTime);
+    }
+
+    return combined;
+  }, [notes, harmonyVoices, voiceEnabled, leadVoiceEnabled, chords, chordsEnabled, tempo]);
 
   const { analyze, isAnalyzing, progress, error } = useAudioAnalysis();
   const { play, playFrom, stop, toggle, setTempo: setPlaybackTempo, setCursorPosition, playbackState, cursorPosition, isLoading } = usePlayback(playbackNotes);
@@ -220,13 +237,21 @@ export default function Home() {
           return;
         }
 
+        // Use detected tempo if confidence is good
+        const effectiveTempo = result.tempoConfidence >= 0.3 ? result.detectedTempo : tempo;
+        if (result.tempoConfidence >= 0.3 && result.detectedTempo !== tempo) {
+          console.log(`Using detected tempo: ${result.detectedTempo} BPM (confidence: ${(result.tempoConfidence * 100).toFixed(0)}%)`);
+          setTempo(result.detectedTempo);
+          setPlaybackTempo(result.detectedTempo);
+        }
+
         setNotes(result.notes);
-        requantize(result.notes, tempo, minQuantization, beatsPerMeasure, keySignature, snapToKeyEnabled);
+        requantize(result.notes, effectiveTempo, minQuantization, beatsPerMeasure, keySignature, snapToKeyEnabled);
       } catch (err) {
         console.error('Analysis failed:', err);
       }
     },
-    [analyze, tempo, minQuantization, beatsPerMeasure, keySignature, snapToKeyEnabled, requantize]
+    [analyze, tempo, minQuantization, beatsPerMeasure, keySignature, snapToKeyEnabled, requantize, setPlaybackTempo]
   );
 
   const handleMidiSelect = useCallback(
@@ -424,6 +449,36 @@ export default function Home() {
       : 'harmony.mid';
     downloadMidiWithHarmony(notes, enabledVoices, tempo, filename);
   }, [notes, harmonyVoices, voiceEnabled, tempo, fileName]);
+
+  // Calculate total beats for chord track
+  const totalBeats = useMemo(() => {
+    if (notes.length === 0) return beatsPerMeasure * 4; // Default 4 measures
+    const lastNote = notes[notes.length - 1];
+    const totalSeconds = lastNote.startTime + lastNote.duration;
+    const secondsPerBeat = 60 / tempo;
+    return Math.ceil(totalSeconds / secondsPerBeat);
+  }, [notes, tempo, beatsPerMeasure]);
+
+  // Recalculate chord durations so each extends until the next chord
+  const recalculateChordDurations = useCallback((chordList: ChordEvent[]): ChordEvent[] => {
+    if (chordList.length === 0) return chordList;
+    const sorted = [...chordList].sort((a, b) => a.startBeat - b.startBeat);
+    return sorted.map((chord, index) => {
+      const nextChordStart = index < sorted.length - 1
+        ? sorted[index + 1].startBeat
+        : Math.max(totalBeats, chord.startBeat + beatsPerMeasure);
+      return { ...chord, durationBeats: nextChordStart - chord.startBeat };
+    });
+  }, [totalBeats, beatsPerMeasure]);
+
+  // Handle chord suggestion
+  const handleSuggestChords = useCallback(() => {
+    if (notes.length === 0) return;
+    const suggested = suggestChords(notes, keySignature, isMinorKey, beatsPerMeasure, tempo);
+    // Recalculate durations so each chord extends until the next
+    const processed = recalculateChordDurations(suggested);
+    setChords(processed);
+  }, [notes, keySignature, isMinorKey, beatsPerMeasure, tempo, recalculateChordDurations]);
 
   // Handle transpose (change key)
   const handleTranspose = useCallback((semitones: number) => {
@@ -679,6 +734,7 @@ export default function Home() {
           voiceEnabled={voiceEnabled}
           onDownloadHarmony={handleDownloadHarmony}
           hasNotes={notes.length > 0}
+          hasChords={chords.length > 0}
           isMinor={isMinorKey}
           onMinorChange={setIsMinorKey}
           leadVoiceEnabled={leadVoiceEnabled}
@@ -794,6 +850,31 @@ export default function Home() {
                     </div>
                   );
                 })}
+
+                {/* Chord Track */}
+                <div className="flex border-b border-zinc-200 last:border-b-0">
+                  <div className="w-28 flex-shrink-0 bg-zinc-50 p-2 flex items-center gap-2 border-r border-zinc-200">
+                    <input
+                      type="checkbox"
+                      checked={chordsEnabled}
+                      onChange={(e) => setChordsEnabled(e.target.checked)}
+                      className="w-3 h-3"
+                    />
+                    <span className="w-3 h-3 rounded-full bg-indigo-500" />
+                    <span className="text-xs font-medium text-zinc-700 truncate">Chords</span>
+                  </div>
+                  <div className="flex-1 bg-white p-2">
+                    <ChordTrack
+                      chords={chords}
+                      onChordsChange={setChords}
+                      totalBeats={totalBeats}
+                      beatsPerMeasure={beatsPerMeasure}
+                      keySignature={keySignature}
+                      isMinor={isMinorKey}
+                      onSuggestChords={notes.length > 0 ? handleSuggestChords : undefined}
+                    />
+                  </div>
+                </div>
               </div>
             </div>
           </div>

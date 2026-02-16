@@ -1,5 +1,6 @@
-import type { NoteEvent } from '@/types/music';
+import type { NoteEvent, ChordEvent } from '@/types/music';
 import type { HarmonyVoice } from '@/lib/harmony/harmonizer';
+import { chordToNoteEvents } from '@/lib/harmony/chords';
 
 interface MidiTrack {
   name: string;
@@ -229,6 +230,70 @@ export function downloadMidiWithHarmony(
       program: 0, // Piano for all voices
     });
   });
+
+  const blob = generateMultiTrackMidiFile(tracks, tempo);
+  downloadBlob(blob, filename);
+}
+
+/**
+ * Trigger download of MIDI file with chords
+ */
+export function downloadMidiWithChords(
+  melody: NoteEvent[],
+  chords: ChordEvent[],
+  tempo: number,
+  filename: string = 'with_chords.mid'
+): void {
+  // Convert chords to note events
+  const chordNotes = chords.flatMap(chord =>
+    chordToNoteEvents(chord, tempo, 3, 60) // octave 3, velocity 60
+  );
+
+  const tracks: MidiTrack[] = [
+    { name: 'Melody', notes: melody, channel: 0, program: 0 },
+    { name: 'Chords', notes: chordNotes, channel: 1, program: 0 },
+  ];
+
+  const blob = generateMultiTrackMidiFile(tracks, tempo);
+  downloadBlob(blob, filename);
+}
+
+/**
+ * Trigger download of full arrangement MIDI (melody + harmony + chords)
+ */
+export function downloadFullArrangement(
+  melody: NoteEvent[],
+  harmonyVoices: HarmonyVoice[],
+  chords: ChordEvent[],
+  tempo: number,
+  filename: string = 'full_arrangement.mid'
+): void {
+  const tracks: MidiTrack[] = [
+    { name: 'Melody', notes: melody, channel: 0, program: 0 }
+  ];
+
+  // Add harmony voices
+  harmonyVoices.forEach((voice, index) => {
+    tracks.push({
+      name: voice.name,
+      notes: voice.notes,
+      channel: (index + 1) % 9, // Channels 1-8 for harmony (skip 9 for drums)
+      program: 0,
+    });
+  });
+
+  // Add chords on a separate channel
+  if (chords.length > 0) {
+    const chordNotes = chords.flatMap(chord =>
+      chordToNoteEvents(chord, tempo, 2, 50) // octave 2, lower velocity
+    );
+    tracks.push({
+      name: 'Chords',
+      notes: chordNotes,
+      channel: 10, // After drum channel
+      program: 0,
+    });
+  }
 
   const blob = generateMultiTrackMidiFile(tracks, tempo);
   downloadBlob(blob, filename);

@@ -1,4 +1,5 @@
-import type { NoteEvent } from '@/types/music';
+import type { NoteEvent, ChordEvent } from '@/types/music';
+import { getChordIntervals } from './chords';
 
 export type HarmonyStyle =
   | 'thirds-above'
@@ -9,7 +10,9 @@ export type HarmonyStyle =
   | 'triads'
   | 'four-part'
   | 'octave-double'
-  | 'parallel-thirds-sixths';
+  | 'parallel-thirds-sixths'
+  | 'chord-tones'
+  | 'chord-based-satb';
 
 export interface HarmonyVoice {
   name: string;
@@ -22,7 +25,9 @@ export interface HarmonyResult {
   voices: HarmonyVoice[];
 }
 
-export const HARMONY_STYLES: { value: HarmonyStyle; label: string; description: string }[] = [
+export const HARMONY_STYLES: { value: HarmonyStyle; label: string; description: string; requiresChords?: boolean }[] = [
+  { value: 'chord-tones', label: 'Chord Tones', description: 'Harmony from chord progression (requires chords)', requiresChords: true },
+  { value: 'chord-based-satb', label: 'Chord SATB', description: 'Four-part harmony using chord progression', requiresChords: true },
   { value: 'thirds-above', label: 'Thirds Above', description: 'Diatonic third above melody (pop/folk)' },
   { value: 'thirds-below', label: 'Thirds Below', description: 'Diatonic third below melody' },
   { value: 'sixths-above', label: 'Sixths Above', description: 'Diatonic sixth above melody' },
@@ -483,17 +488,272 @@ function generateVoiceByChromatic(
 }
 
 /**
+ * Get the chord active at a specific time
+ */
+function getChordAtTime(chords: ChordEvent[], time: number, tempo: number): ChordEvent | null {
+  const secondsPerBeat = 60 / tempo;
+
+  for (const chord of chords) {
+    const chordStart = chord.startBeat * secondsPerBeat;
+    const chordEnd = (chord.startBeat + chord.durationBeats) * secondsPerBeat;
+
+    if (time >= chordStart && time < chordEnd) {
+      return chord;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Get MIDI notes for a chord at a specific octave
+ */
+function getChordMidiNotes(chord: ChordEvent, baseOctave: number): number[] {
+  const rootMap: Record<string, number> = {
+    'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3,
+    'E': 4, 'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8,
+    'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11
+  };
+
+  const rootSemitone = rootMap[chord.root] ?? 0;
+  const baseMidi = 12 + (baseOctave * 12) + rootSemitone;
+  const intervals = getChordIntervals(chord);
+
+  return intervals.map(interval => baseMidi + interval);
+}
+
+/**
+ * Find the best chord tone for a melody note
+ */
+function findBestChordTone(
+  melodyMidi: number,
+  chordMidiNotes: number[],
+  targetRange: { min: number; max: number },
+  preferBelow: boolean
+): number {
+  // Expand chord notes to multiple octaves
+  const expandedChordNotes: number[] = [];
+  for (const note of chordMidiNotes) {
+    for (let octave = -2; octave <= 2; octave++) {
+      const expanded = note + (octave * 12);
+      if (expanded >= targetRange.min && expanded <= targetRange.max) {
+        expandedChordNotes.push(expanded);
+      }
+    }
+  }
+
+  if (expandedChordNotes.length === 0) {
+    // Fallback: just use a third interval
+    return preferBelow ? melodyMidi - 4 : melodyMidi + 4;
+  }
+
+  // Find the chord tone that's closest to the melody but in the target direction
+  let bestNote = expandedChordNotes[0];
+  let bestScore = -Infinity;
+
+  for (const chordNote of expandedChordNotes) {
+    let score = 0;
+
+    // Prefer notes in the right direction
+    if (preferBelow && chordNote < melodyMidi) {
+      score += 50;
+    } else if (!preferBelow && chordNote > melodyMidi) {
+      score += 50;
+    }
+
+    // Prefer notes that are close but not too close
+    const distance = Math.abs(chordNote - melodyMidi);
+    if (distance >= 3 && distance <= 7) {
+      score += 30; // Third to fifth interval - nice harmony
+    } else if (distance >= 8 && distance <= 12) {
+      score += 20; // Sixth to octave
+    } else if (distance < 3) {
+      score -= 20; // Too close, might clash
+    }
+
+    // Avoid unison
+    if (distance === 0) {
+      score -= 100;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestNote = chordNote;
+    }
+  }
+
+  return bestNote;
+}
+
+/**
+ * Generate harmony voices based on chord progression
+ */
+function generateChordBasedHarmony(
+  melody: NoteEvent[],
+  chords: ChordEvent[],
+  tempo: number
+): HarmonyVoice[] {
+  if (chords.length === 0) {
+    return [];
+  }
+
+  const voice2: NoteEvent[] = [];
+  const voice3: NoteEvent[] = [];
+
+  for (const note of melody) {
+    const chord = getChordAtTime(chords, note.startTime, tempo);
+
+    if (!chord) {
+      // No chord at this time, skip or use simple interval
+      voice2.push({
+        ...note,
+        midi: note.midi - 4, // Default to major third below
+        frequency: 440 * Math.pow(2, (note.midi - 4 - 69) / 12),
+      });
+      voice3.push({
+        ...note,
+        midi: note.midi - 7, // Default to fifth below
+        frequency: 440 * Math.pow(2, (note.midi - 7 - 69) / 12),
+      });
+      continue;
+    }
+
+    // Get chord notes in a range suitable for harmony
+    const chordNotes = getChordMidiNotes(chord, 3);
+
+    // Voice 2: Find a chord tone below the melody (alto range)
+    const voice2Midi = findBestChordTone(
+      note.midi,
+      chordNotes,
+      { min: 48, max: note.midi - 2 },
+      true
+    );
+
+    // Voice 3: Find a chord tone further below (tenor range)
+    const voice3Midi = findBestChordTone(
+      note.midi,
+      chordNotes,
+      { min: 36, max: voice2Midi - 2 },
+      true
+    );
+
+    voice2.push({
+      ...note,
+      midi: voice2Midi,
+      frequency: 440 * Math.pow(2, (voice2Midi - 69) / 12),
+    });
+
+    voice3.push({
+      ...note,
+      midi: voice3Midi,
+      frequency: 440 * Math.pow(2, (voice3Midi - 69) / 12),
+    });
+  }
+
+  return [
+    { name: 'Harmony (Alto)', notes: voice2, color: '#10b981' },
+    { name: 'Harmony (Tenor)', notes: voice3, color: '#f59e0b' },
+  ];
+}
+
+/**
+ * Generate SATB harmony based on chord progression
+ */
+function generateChordBasedSATB(
+  melody: NoteEvent[],
+  chords: ChordEvent[],
+  tempo: number
+): HarmonyVoice[] {
+  if (chords.length === 0) {
+    return [];
+  }
+
+  const alto: NoteEvent[] = [];
+  const tenor: NoteEvent[] = [];
+  const bass: NoteEvent[] = [];
+
+  for (const note of melody) {
+    const chord = getChordAtTime(chords, note.startTime, tempo);
+
+    if (!chord) {
+      // No chord, use simple intervals
+      const altoMidi = note.midi - 4;
+      const tenorMidi = note.midi - 9;
+      const bassMidi = note.midi - 16;
+
+      alto.push({ ...note, midi: altoMidi, frequency: 440 * Math.pow(2, (altoMidi - 69) / 12) });
+      tenor.push({ ...note, midi: tenorMidi, frequency: 440 * Math.pow(2, (tenorMidi - 69) / 12) });
+      bass.push({ ...note, midi: bassMidi, frequency: 440 * Math.pow(2, (bassMidi - 69) / 12) });
+      continue;
+    }
+
+    const chordNotes = getChordMidiNotes(chord, 3);
+
+    // Alto: chord tone in alto range, below soprano
+    const altoMidi = findBestChordTone(
+      note.midi,
+      chordNotes,
+      VOICE_RANGES.alto,
+      true
+    );
+
+    // Tenor: chord tone in tenor range, below alto
+    const tenorMidi = findBestChordTone(
+      altoMidi,
+      chordNotes,
+      VOICE_RANGES.tenor,
+      true
+    );
+
+    // Bass: prefer root or fifth in bass range
+    const rootMap: Record<string, number> = {
+      'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3,
+      'E': 4, 'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8,
+      'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11
+    };
+    const rootSemitone = rootMap[chord.bassNote || chord.root] ?? 0;
+    let bassMidi = 36 + rootSemitone; // Start at octave 2
+    while (bassMidi < VOICE_RANGES.bass.min) bassMidi += 12;
+    while (bassMidi > VOICE_RANGES.bass.max) bassMidi -= 12;
+
+    alto.push({ ...note, midi: altoMidi, frequency: 440 * Math.pow(2, (altoMidi - 69) / 12) });
+    tenor.push({ ...note, midi: tenorMidi, frequency: 440 * Math.pow(2, (tenorMidi - 69) / 12) });
+    bass.push({ ...note, midi: bassMidi, frequency: 440 * Math.pow(2, (bassMidi - 69) / 12) });
+  }
+
+  return [
+    { name: 'Alto', notes: alto, color: '#10b981' },
+    { name: 'Tenor', notes: tenor, color: '#f59e0b' },
+    { name: 'Bass', notes: bass, color: '#8b5cf6' },
+  ];
+}
+
+/**
  * Main harmonizer function - generates harmony voices based on style
  */
 export function generateHarmony(
   melody: NoteEvent[],
   style: HarmonyStyle,
   key: string = 'C',
-  isMinor: boolean = false
+  isMinor: boolean = false,
+  chords: ChordEvent[] = [],
+  tempo: number = 120
 ): HarmonyResult {
   const voices: HarmonyVoice[] = [];
 
   switch (style) {
+    case 'chord-tones':
+      if (chords.length > 0) {
+        voices.push(...generateChordBasedHarmony(melody, chords, tempo));
+      }
+      break;
+
+    case 'chord-based-satb':
+      if (chords.length > 0) {
+        voices.push(...generateChordBasedSATB(melody, chords, tempo));
+      }
+      break;
+
     case 'thirds-above':
       voices.push({
         name: 'Voice 2 - Upper Third',
